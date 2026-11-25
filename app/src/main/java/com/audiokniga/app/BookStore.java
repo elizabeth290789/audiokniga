@@ -116,7 +116,8 @@ final class BookStore {
                 }
                 index.remove(i);
                 boolean saved = preferences.edit().putString(INDEX_KEY, index.toString())
-                        .remove("position." + id).remove("language." + id).commit();
+                        .remove("position." + id).remove("language." + id)
+                        .remove(voiceKey(id, "ru")).remove(voiceKey(id, "en")).commit();
                 if (saved) {
                     textFile(id).delete();
                 }
@@ -146,6 +147,28 @@ final class BookStore {
                 preferences.edit().putString("language." + id, "en".equals(language) ? "en" : "ru").apply();
             }
         }
+    }
+
+    String voice(String id, String language) {
+        return preferences.getString(voiceKey(id, language), null);
+    }
+
+    void saveVoice(String id, String language, String voiceId) {
+        synchronized (LOCK) {
+            if (find(index(), id) == null) return;
+            String key = voiceKey(id, language);
+            SharedPreferences.Editor editor = preferences.edit();
+            if (voiceId == null) {
+                editor.remove(key);
+            } else {
+                editor.putString(key, voiceId);
+            }
+            editor.apply();
+        }
+    }
+
+    private static String voiceKey(String id, String language) {
+        return "voice." + id + "." + language;
     }
 
     float speed() {

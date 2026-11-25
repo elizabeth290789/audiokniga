@@ -28,7 +28,12 @@ import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.Voice;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -42,31 +47,39 @@ public final class PlaybackService extends Service {
     public static final String ACTION_SEEK = PREFIX + "SEEK";
     public static final String ACTION_SPEED = PREFIX + "SPEED";
     public static final String ACTION_LANGUAGE = PREFIX + "LANGUAGE";
+    public static final String ACTION_LIST_VOICES = PREFIX + "LIST_VOICES";
+    public static final String ACTION_VOICE = PREFIX + "VOICE";
+    public static final String ACTION_PREVIEW = PREFIX + "PREVIEW";
+    public static final String ACTION_CANCEL_PREVIEW = PREFIX + "CANCEL_PREVIEW";
     public static final String EXTRA_BOOK_ID = "book_id";
     public static final String EXTRA_POSITION = "position";
     public static final String EXTRA_SPEED = "speed";
     public static final String EXTRA_LANGUAGE = "language";
+    public static final String EXTRA_VOICE = "voice";
 
     private static final String CHANNEL_ID = "reading";
     private static final int NOTIFICATION_ID = 1;
     private static final int CHUNK_SIZE = 900;
     private static final long SAVE_DELAY_MS = 2_000;
-    private static final long UPDATE_DELAY_MS = 450;
+    private static final long UPDATE_DELAY_MS = 120;
+    private static final Locale RUSSIAN = Locale.forLanguageTag("ru");
 
     public static final class Snapshot {
         public final String bookId;
         public final String language;
         public final int position;
+        public final int rangeEnd;
         public final boolean playing;
         public final boolean preparing;
         public final boolean attached;
         public final String error;
 
-        private Snapshot(String bookId, String language, int position, boolean playing,
+        private Snapshot(String bookId, String language, int position, int rangeEnd, boolean playing,
                          boolean preparing, boolean attached, String error) {
             this.bookId = bookId;
             this.language = language;
             this.position = position;
+            this.rangeEnd = rangeEnd;
             this.playing = playing;
             this.preparing = preparing;
             this.attached = attached;
@@ -74,12 +87,45 @@ public final class PlaybackService extends Service {
         }
     }
 
+    public static final class VoiceOption {
+        public final String id;
+        public final String label;
+
+        private VoiceOption(String id, String label) {
+            this.id = id;
+            this.label = label;
+        }
+    }
+
+    public static final class VoiceCatalog {
+        public final String language;
+        public final List<VoiceOption> options;
+        public final boolean loading;
+        public final boolean previewing;
+        public final String error;
+
+        private VoiceCatalog(String language, List<VoiceOption> options, boolean loading,
+                             boolean previewing, String error) {
+            this.language = language;
+            this.options = options;
+            this.loading = loading;
+            this.previewing = previewing;
+            this.error = error;
+        }
+    }
+
     private static final CopyOnWriteArrayList<Runnable> LISTENERS = new CopyOnWriteArrayList<>();
     private static volatile Snapshot snapshot =
-            new Snapshot(null, "ru", 0, false, false, false, null);
+            new Snapshot(null, "ru", 0, 0, false, false, false, null);
+    private static volatile VoiceCatalog voiceCatalog =
+            new VoiceCatalog(null, Collections.emptyList(), false, false, null);
 
     public static Snapshot snapshot() {
         return snapshot;
+    }
+
+    public static VoiceCatalog voiceCatalog() {
+        return voiceCatalog;
     }
 
     static void addListener(Runnable listener) {
@@ -95,20 +141,36 @@ public final class PlaybackService extends Service {
     private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (wantsPlayback) pause();
+            if (wantsPlayback) {
+                pause();
+            } else if (preview != null) {
+                finishPreview(null);
+            }
         }
     };
+
+    private static final class VoicePreview {
+        final String language;
+        final String voiceId;
+        String utteranceId;
+
+        VoicePreview(String language, String voiceId) {
+            this.language = language;
+            this.voiceId = voiceId;
+        }
+    }
 
     private BookStore store;
     private NotificationManager notifications;
     private AudioManager audioManager;
     private AudioAttributes audioAttributes;
     private AudioFocusRequest audioFocus;
+    private AudioFocusRequest previewFocus;
+    private AudioFocusRequest heldFocus;
     private PowerManager.WakeLock wakeLock;
     private MediaSession mediaSession;
     private TextToSpeech engine;
     private boolean engineReady;
-    private boolean hasFocus;
     private boolean foreground;
     private boolean wantsPlayback;
     private boolean loading;
@@ -116,16 +178,24 @@ public final class PlaybackService extends Service {
     private int loadGeneration;
     private int engineGeneration;
     private int utteranceGeneration;
+    private int latestStartId;
     private String bookId;
     private String title = "";
     private String language = "ru";
     private String selectedLanguage;
+    private String selectedVoicePreference;
+    private String enginePackage;
+    private String catalogRequest;
+    private VoicePreview preview;
     private String bookText;
+    private BookPages bookPages;
     private String utteranceId;
     private String error;
     private int position;
     private int utteranceStart;
     private int utteranceEnd;
+    private int rangeEnd;
+    private boolean hasWordRange;
     private float speed = 1f;
     private long lastSaved;
     private long lastPublished;
@@ -149,7 +219,12 @@ public final class PlaybackService extends Service {
         audioFocus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(audioAttributes)
                 .setWillPauseWhenDucked(true)
-                .setOnAudioFocusChangeListener(this::onAudioFocusChanged, handler)
+                .setOnAudioFocusChangeListener(focus -> onAudioFocusChanged(focus, audioFocus), handler)
+                .build();
+        previewFocus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(audioAttributes)
+                .setWillPauseWhenDucked(true)
+                .setOnAudioFocusChangeListener(focus -> onAudioFocusChanged(focus, previewFocus), handler)
                 .build();
         PowerManager powerManager = getSystemService(PowerManager.class);
         wakeLock = powerManager.newWakeLock(
@@ -185,6 +260,7 @@ public final class PlaybackService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        latestStartId = startId;
         if (intent == null || intent.getAction() == null) {
             stopSelf(startId);
             return START_NOT_STICKY;
@@ -215,10 +291,23 @@ public final class PlaybackService extends Service {
             case ACTION_LANGUAGE:
                 changeLanguage(requestedBook, intent.getStringExtra(EXTRA_LANGUAGE));
                 break;
+            case ACTION_LIST_VOICES:
+                listVoices(intent.getStringExtra(EXTRA_LANGUAGE));
+                break;
+            case ACTION_VOICE:
+                changeVoice(requestedBook, intent.getStringExtra(EXTRA_LANGUAGE),
+                        intent.getStringExtra(EXTRA_VOICE));
+                break;
+            case ACTION_PREVIEW:
+                requestPreview(intent.getStringExtra(EXTRA_LANGUAGE), intent.getStringExtra(EXTRA_VOICE));
+                break;
+            case ACTION_CANCEL_PREVIEW:
+                if (preview != null) finishPreview(null);
+                break;
             default:
                 break;
         }
-        if (bookId == null && !foreground) stopSelf(startId);
+        stopIfIdle();
         return START_NOT_STICKY;
     }
 
@@ -228,7 +317,11 @@ public final class PlaybackService extends Service {
     }
 
     private void play(String requestedBook, Integer startPosition) {
+        clearPreview(null);
         boolean alreadyPlaying = wantsPlayback;
+        if (!alreadyPlaying && engineReady && !Objects.equals(enginePackage, engine.getDefaultEngine())) {
+            resetEngine();
+        }
         wantsPlayback = true;
         error = null;
         if (requestedBook == null) requestedBook = bookId;
@@ -239,6 +332,7 @@ public final class PlaybackService extends Service {
             loadGeneration++;
             loading = false;
             bookText = null;
+            bookPages = null;
             bookId = requestedBook;
             position = 0;
             title = "";
@@ -286,6 +380,7 @@ public final class PlaybackService extends Service {
         reader.execute(() -> {
             try {
                 String text = store.readText(requested);
+                BookPages pages = new BookPages(text);
                 handler.post(() -> {
                     if (destroyed || generation != loadGeneration) return;
                     loading = false;
@@ -294,6 +389,7 @@ public final class PlaybackService extends Service {
                         return;
                     }
                     bookText = text;
+                    bookPages = pages;
                     position = clampPosition(position);
                     if (restartAtEnd && wantsPlayback && position >= bookText.length()) {
                         position = 0;
@@ -317,8 +413,7 @@ public final class PlaybackService extends Service {
                 handler.post(() -> onEngineInitialized(generation, status)));
         handler.postDelayed(() -> {
             if (!destroyed && engineGeneration == generation && !engineReady) {
-                resetEngine();
-                if (wantsPlayback) fail("Системная озвучка не ответила. Проверьте настройки синтеза речи Android.");
+                engineFailed("Системная озвучка не ответила. Проверьте настройки синтеза речи Android.");
             }
         }, 15_000);
     }
@@ -326,11 +421,11 @@ public final class PlaybackService extends Service {
     private void onEngineInitialized(int generation, int status) {
         if (destroyed || generation != engineGeneration) return;
         if (status != TextToSpeech.SUCCESS) {
-            resetEngine();
-            if (wantsPlayback) fail("Не удалось запустить системную озвучку. Проверьте настройки синтеза речи Android.");
+            engineFailed("Не удалось запустить системную озвучку. Проверьте настройки синтеза речи Android.");
             return;
         }
         engineReady = true;
+        enginePackage = engine.getDefaultEngine();
         engine.setAudioAttributes(audioAttributes);
         engine.setOnUtteranceProgressListener(new UtteranceProgressListener() {
             @Override
@@ -339,7 +434,7 @@ public final class PlaybackService extends Service {
 
             @Override
             public void onRangeStart(String id, int start, int end, int frame) {
-                handler.post(() -> onSpeechRange(id, start));
+                handler.post(() -> onSpeechRange(id, start, end));
             }
 
             @Override
@@ -350,15 +445,39 @@ public final class PlaybackService extends Service {
             @Override
             public void onError(String id) {
                 handler.post(() -> {
-                    if (id.equals(utteranceId)) fail("Системному голосу не удалось озвучить этот фрагмент.");
+                    if (preview != null && id.equals(preview.utteranceId)) {
+                        finishPreview("Не удалось воспроизвести пример голоса.");
+                    } else if (id.equals(utteranceId)) {
+                        fail("Системному голосу не удалось озвучить этот фрагмент.");
+                    }
                 });
             }
         });
+        completeCatalogRequest();
+        startPreviewIfReady();
         startSpeechIfReady();
+        stopIfIdle();
+    }
+
+    private void engineFailed(String message) {
+        resetEngine();
+        if (catalogRequest != null) {
+            String requested = catalogRequest;
+            catalogRequest = null;
+            setVoiceCatalog(new VoiceCatalog(requested, Collections.emptyList(), false, preview != null, message));
+        }
+        if (wantsPlayback) {
+            fail(message);
+        } else if (preview != null) {
+            finishPreview(message);
+        }
+        stopIfIdle();
     }
 
     private void startSpeechIfReady() {
-        if (!wantsPlayback || loading || bookText == null || !engineReady || utteranceId != null) return;
+        if (!wantsPlayback || loading || bookText == null || !engineReady || utteranceId != null || preview != null) {
+            return;
+        }
         while (position < bookText.length() && Character.isWhitespace(bookText.charAt(position))) {
             position++;
         }
@@ -366,25 +485,23 @@ public final class PlaybackService extends Service {
             pause();
             return;
         }
-        if (!selectVoice()) {
-            String languageName = "en".equals(language) ? "английский" : "русский";
-            fail("Установите " + languageName + " офлайн-голос в настройках синтеза речи Android.");
+        if (!selectReadingVoice()) {
+            fail(missingVoice(language));
             return;
         }
         if (engine.setSpeechRate(speed) != TextToSpeech.SUCCESS) {
             fail("Системному голосу не удалось применить скорость чтения.");
             return;
         }
-        if (!hasFocus) {
-            hasFocus = audioManager.requestAudioFocus(audioFocus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-            if (!hasFocus) {
-                fail("Звук занят другим приложением. Попробуйте снова.");
-                return;
-            }
+        if (!requestFocus(audioFocus)) {
+            fail("Звук занят другим приложением. Попробуйте снова.");
+            return;
         }
         wakeLock.acquire(5 * 60_000L);
         utteranceStart = position;
-        utteranceEnd = chunkEnd(bookText, position);
+        utteranceEnd = Math.min(chunkEnd(bookText, position), bookPages.end(bookPages.pageForPosition(position)));
+        rangeEnd = utteranceEnd;
+        hasWordRange = false;
         utteranceId = Integer.toString(++utteranceGeneration);
         int result = engine.speak(bookText.substring(utteranceStart, utteranceEnd),
                 TextToSpeech.QUEUE_FLUSH, new Bundle(), utteranceId);
@@ -395,31 +512,179 @@ public final class PlaybackService extends Service {
         refresh();
     }
 
-    private boolean selectVoice() {
-        if (language.equals(selectedLanguage)) return true;
+    private void listVoices(String requested) {
+        if (!supportedLanguage(requested)) return;
+        catalogRequest = requested;
+        setVoiceCatalog(new VoiceCatalog(requested, Collections.emptyList(), true, preview != null, null));
+        if (engineReady && !wantsPlayback && preview == null
+                && !Objects.equals(enginePackage, engine.getDefaultEngine())) {
+            resetEngine();
+        }
+        if (engineReady) {
+            completeCatalogRequest();
+        } else if (engine == null) {
+            initEngine();
+        }
+    }
+
+    private void completeCatalogRequest() {
+        if (catalogRequest == null) return;
+        String requested = catalogRequest;
+        catalogRequest = null;
+        List<VoiceOption> options = new ArrayList<>();
+        for (Voice voice : offlineVoices(requested)) {
+            String name = voice.getLocale().getDisplayName(RUSSIAN) + " · " + voice.getName();
+            options.add(new VoiceOption(voiceId(voice), name));
+        }
+        setVoiceCatalog(new VoiceCatalog(requested, Collections.unmodifiableList(options), false, preview != null,
+                options.isEmpty() ? missingVoice(requested) : null));
+    }
+
+    private void changeVoice(String requestedBook, String requestedLanguage, String requestedVoice) {
+        if (requestedBook == null || !supportedLanguage(requestedLanguage)) return;
+        store.saveVoice(requestedBook, requestedLanguage, requestedVoice);
+        if (requestedBook.equals(bookId) && requestedLanguage.equals(language)) {
+            error = null;
+            restartUtterance();
+        } else {
+            publish();
+        }
+    }
+
+    private void requestPreview(String requestedLanguage, String requestedVoice) {
+        if (!supportedLanguage(requestedLanguage)) return;
+        clearPreview(null);
+        stopUtterance();
+        savePosition();
+        VoicePreview request = new VoicePreview(requestedLanguage, requestedVoice);
+        preview = request;
+        setPreviewStatus(true, null);
+        publish();
+        if (!engineReady && engine == null) initEngine();
+        startPreviewIfReady();
+        handler.postDelayed(() -> {
+            if (preview == request) finishPreview("Пример голоса не удалось воспроизвести вовремя.");
+        }, 25_000);
+    }
+
+    private void startPreviewIfReady() {
+        if (!engineReady || preview == null || preview.utteranceId != null) return;
+        List<Voice> voices = offlineVoices(preview.language);
+        Voice voice = chooseVoice(voices, preview.voiceId);
+        if (voice == null) {
+            finishPreview(missingVoice(preview.language));
+            return;
+        }
+        if (preview.voiceId != null && !preview.voiceId.equals(voiceId(voice))) {
+            finishPreview("Этот голос недоступен. Откройте список голосов снова.");
+            return;
+        }
+        if (!requestFocus(previewFocus)) {
+            finishPreview("Звук занят другим приложением. Попробуйте снова.");
+            return;
+        }
+        selectedLanguage = null;
+        if (engine.setVoice(voice) != TextToSpeech.SUCCESS || engine.setSpeechRate(1f) != TextToSpeech.SUCCESS) {
+            finishPreview("Не удалось применить настройки голоса.");
+            return;
+        }
+        String sample = "en".equals(preview.language)
+                ? "It was a bright morning, and the birds were singing in the garden."
+                : "В старом замке висел тяжёлый замок. Утром я полил цветы и открыл окно.";
+        preview.utteranceId = Integer.toString(++utteranceGeneration);
+        if (engine.speak(sample, TextToSpeech.QUEUE_FLUSH, new Bundle(), preview.utteranceId) != TextToSpeech.SUCCESS) {
+            finishPreview("Не удалось воспроизвести пример голоса.");
+        }
+    }
+
+    private void finishPreview(String message) {
+        clearPreview(message);
+        publish();
+        startSpeechIfReady();
+        stopIfIdle();
+    }
+
+    private void clearPreview(String message) {
+        if (preview == null) return;
+        String id = preview.utteranceId;
+        preview = null;
+        if (id != null && engine != null) engine.stop();
+        if (!wantsPlayback) releaseAudio();
+        setPreviewStatus(false, message);
+    }
+
+    private void setPreviewStatus(boolean previewing, String message) {
+        VoiceCatalog previous = voiceCatalog;
+        setVoiceCatalog(new VoiceCatalog(previous.language, previous.options, previous.loading, previewing, message));
+    }
+
+    private void setVoiceCatalog(VoiceCatalog result) {
+        voiceCatalog = result;
+        notifyListeners();
+    }
+
+    private void stopIfIdle() {
+        if (bookId == null && !foreground && preview == null && catalogRequest == null) {
+            stopSelf(latestStartId);
+        }
+    }
+
+    private boolean selectReadingVoice() {
+        String preferred = store.voice(bookId, language);
+        if (language.equals(selectedLanguage) && Objects.equals(preferred, selectedVoicePreference)) return true;
+        Voice voice = chooseVoice(offlineVoices(language), preferred);
+        if (voice == null || engine.setVoice(voice) != TextToSpeech.SUCCESS) return false;
+        selectedLanguage = language;
+        selectedVoicePreference = preferred;
+        return true;
+    }
+
+    private Voice chooseVoice(List<Voice> voices, String preferred) {
+        if (voices.isEmpty()) return null;
+        if (preferred != null) {
+            for (Voice voice : voices) {
+                if (preferred.equals(voiceId(voice))) return voice;
+            }
+        }
+        return voices.get(0);
+    }
+
+    private List<Voice> offlineVoices(String requestedLanguage) {
         Set<Voice> voices = engine.getVoices();
-        if (voices == null) return false;
-        String preferredRegion = "en".equals(language) ? "US" : "RU";
-        Voice best = null;
+        if (voices == null) return Collections.emptyList();
+        List<Voice> offline = new ArrayList<>();
         for (Voice voice : voices) {
             Locale locale = voice.getLocale();
-            if (!locale.getLanguage().equals(language) || voice.isNetworkConnectionRequired()
+            if (!locale.getLanguage().equals(requestedLanguage) || voice.isNetworkConnectionRequired()
                     || (voice.getFeatures() != null
                     && voice.getFeatures().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED))) {
                 continue;
             }
-            if (best == null || voiceScore(voice, preferredRegion) > voiceScore(best, preferredRegion)) {
-                best = voice;
-            }
+            offline.add(voice);
         }
-        if (best == null || engine.setVoice(best) != TextToSpeech.SUCCESS) return false;
-        selectedLanguage = language;
-        return true;
+        String preferredRegion = "en".equals(requestedLanguage) ? "US" : "RU";
+        offline.sort(Comparator.<Voice>comparingInt(voice -> voiceScore(voice, preferredRegion))
+                .reversed().thenComparing(Voice::getName));
+        return offline;
     }
 
-    private int voiceScore(Voice voice, String preferredRegion) {
+    private static int voiceScore(Voice voice, String preferredRegion) {
         int regionScore = preferredRegion.equals(voice.getLocale().getCountry()) ? 1_000 : 0;
         return regionScore + voice.getQuality() - voice.getLatency() / 10;
+    }
+
+    private String voiceId(Voice voice) {
+        String packageName = enginePackage == null ? "default" : enginePackage;
+        return packageName + "/" + voice.getName();
+    }
+
+    private static boolean supportedLanguage(String language) {
+        return "ru".equals(language) || "en".equals(language);
+    }
+
+    private static String missingVoice(String language) {
+        String name = "en".equals(language) ? "английский" : "русский";
+        return "Установите " + name + " офлайн-голос в настройках синтеза речи Android.";
     }
 
     private static int chunkEnd(String text, int start) {
@@ -438,17 +703,29 @@ public final class PlaybackService extends Service {
         return wordBoundary;
     }
 
-    private void onSpeechRange(String id, int offset) {
+    private void onSpeechRange(String id, int offset, int endOffset) {
         if (!id.equals(utteranceId)) return;
-        int newPosition = utteranceStart + offset;
+        int utteranceLength = utteranceEnd - utteranceStart;
+        if (offset < 0 || offset >= utteranceLength || endOffset <= offset) return;
+        int newPosition = clampPosition(utteranceStart + offset);
         if (newPosition < position || newPosition >= utteranceEnd) return;
-        position = clampPosition(newPosition);
+        position = newPosition;
+        rangeEnd = utteranceStart + Math.min(endOffset, utteranceLength);
+        if (rangeEnd < utteranceEnd && Character.isLowSurrogate(bookText.charAt(rangeEnd))) {
+            rangeEnd++;
+        }
         long now = SystemClock.elapsedRealtime();
         if (now - lastSaved >= SAVE_DELAY_MS) savePosition();
-        if (now - lastPublished >= UPDATE_DELAY_MS) publish();
+        if (!hasWordRange || now - lastPublished >= UPDATE_DELAY_MS) publish();
+        hasWordRange = true;
     }
 
     private void onSpeechDone(String id) {
+        if (preview != null && id.equals(preview.utteranceId)) {
+            preview.utteranceId = null;
+            finishPreview(null);
+            return;
+        }
         if (!id.equals(utteranceId)) return;
         utteranceId = null;
         position = utteranceEnd;
@@ -487,7 +764,7 @@ public final class PlaybackService extends Service {
     }
 
     private void changeLanguage(String requestedBook, String requestedLanguage) {
-        if (!"ru".equals(requestedLanguage) && !"en".equals(requestedLanguage)) return;
+        if (!supportedLanguage(requestedLanguage)) return;
         if (requestedBook == null) requestedBook = bookId;
         if (requestedBook == null) return;
         store.saveLanguage(requestedBook, requestedLanguage);
@@ -504,12 +781,18 @@ public final class PlaybackService extends Service {
         startSpeechIfReady();
     }
 
-    private void onAudioFocusChanged(int focus) {
-        if (focus < 0 && wantsPlayback) pause();
+    private void onAudioFocusChanged(int focus, AudioFocusRequest request) {
+        if (focus >= 0 || heldFocus != request) return;
+        if (wantsPlayback) {
+            pause();
+        } else if (preview != null) {
+            finishPreview(null);
+        }
     }
 
     private void pause() {
         wantsPlayback = false;
+        clearPreview(null);
         stopUtterance();
         releaseAudio();
         savePosition();
@@ -522,6 +805,7 @@ public final class PlaybackService extends Service {
 
     private void stop() {
         wantsPlayback = false;
+        clearPreview(null);
         savePosition();
         stopUtterance();
         releaseAudio();
@@ -531,6 +815,7 @@ public final class PlaybackService extends Service {
         title = "";
         position = 0;
         bookText = null;
+        bookPages = null;
         error = null;
         stopForeground(STOP_FOREGROUND_REMOVE);
         foreground = false;
@@ -543,6 +828,7 @@ public final class PlaybackService extends Service {
     private void fail(String message) {
         error = message;
         wantsPlayback = false;
+        clearPreview(message);
         stopUtterance();
         releaseAudio();
         savePosition();
@@ -560,10 +846,21 @@ public final class PlaybackService extends Service {
         engine.stop();
     }
 
+    private boolean requestFocus(AudioFocusRequest request) {
+        if (heldFocus == request || (heldFocus == audioFocus && request == previewFocus)) return true;
+        if (heldFocus != null) {
+            audioManager.abandonAudioFocusRequest(heldFocus);
+            heldFocus = null;
+        }
+        if (audioManager.requestAudioFocus(request) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return false;
+        heldFocus = request;
+        return true;
+    }
+
     private void releaseAudio() {
-        if (hasFocus) {
-            audioManager.abandonAudioFocusRequest(audioFocus);
-            hasFocus = false;
+        if (heldFocus != null) {
+            audioManager.abandonAudioFocusRequest(heldFocus);
+            heldFocus = null;
         }
         if (wakeLock.isHeld()) wakeLock.release();
     }
@@ -581,7 +878,12 @@ public final class PlaybackService extends Service {
 
     private void publish() {
         lastPublished = SystemClock.elapsedRealtime();
-        snapshot = new Snapshot(bookId, language, position, wantsPlayback, isPreparing(), !destroyed, error);
+        int currentEnd = utteranceId == null ? position : rangeEnd;
+        snapshot = new Snapshot(bookId, language, position, currentEnd, wantsPlayback, isPreparing(), !destroyed, error);
+        notifyListeners();
+    }
+
+    private static void notifyListeners() {
         for (Runnable listener : LISTENERS) {
             listener.run();
         }
@@ -658,6 +960,8 @@ public final class PlaybackService extends Service {
         engineGeneration++;
         engineReady = false;
         selectedLanguage = null;
+        selectedVoicePreference = null;
+        enginePackage = null;
         if (engine != null) {
             engine.shutdown();
             engine = null;
@@ -668,6 +972,12 @@ public final class PlaybackService extends Service {
     public void onDestroy() {
         destroyed = true;
         wantsPlayback = false;
+        clearPreview(null);
+        if (catalogRequest != null) {
+            setVoiceCatalog(new VoiceCatalog(catalogRequest, Collections.emptyList(), false, false,
+                    "Системная озвучка отключилась. Откройте список голосов снова."));
+            catalogRequest = null;
+        }
         stopUtterance();
         savePosition();
         releaseAudio();

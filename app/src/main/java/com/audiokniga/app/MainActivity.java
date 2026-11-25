@@ -25,6 +25,8 @@ import android.view.View;
 import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -69,10 +71,19 @@ public final class MainActivity extends Activity {
     private boolean importing;
     private String playerId;
     private String lastError;
+    private AlertDialog voiceDialog;
+    private LinearLayout voiceDialogContent;
+    private String voiceBook;
+    private String voiceLanguage;
+    private String voiceChoice;
+    private boolean previewRequested;
+    private PlaybackService.VoiceCatalog catalogAtOpen;
+    private PlaybackService.VoiceCatalog displayedCatalog;
 
     private final Runnable playbackChanges = () -> {
         renderPlayer();
         renderLibrary();
+        renderVoices();
     };
 
     @Override protected void onCreate(Bundle state) {
@@ -101,6 +112,9 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onStop() {
+        if (voiceDialog != null) {
+            voiceDialog.dismiss();
+        }
         PlaybackService.removeListener(playbackChanges);
         super.onStop();
     }
@@ -242,6 +256,18 @@ public final class MainActivity extends Activity {
         playerSpeed = button("", WHITE, 0xff356451, 13);
         controls.addView(playerSpeed, new LinearLayout.LayoutParams(-2, dp(48)));
         playerSpeed.setOnClickListener(view -> chooseSpeed());
+
+        LinearLayout bookActions = row();
+        playerContainer.addView(bookActions, spaced(10));
+        TextView openText = button("Текст книги", WHITE, 0xff356451, 13);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0, dp(48), 1.7f);
+        textParams.rightMargin = dp(8);
+        bookActions.addView(openText, textParams);
+        openText.setOnClickListener(view -> openReader());
+
+        TextView voices = button("Голос", WHITE, 0xff356451, 13);
+        bookActions.addView(voices, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        voices.setOnClickListener(view -> chooseVoice());
     }
 
     private void refreshSelection() {
@@ -535,6 +561,131 @@ public final class MainActivity extends Activity {
             renderPlayer();
             renderLibrary();
         }
+    }
+
+    private void openReader() {
+        BookStore.Book book = store.get(selectedId);
+        if (book != null) {
+            startActivity(new Intent(this, ReaderActivity.class)
+                    .putExtra(PlaybackService.EXTRA_BOOK_ID, book.id));
+        }
+    }
+
+    private void chooseVoice() {
+        BookStore.Book book = store.get(selectedId);
+        if (book == null) {
+            return;
+        }
+        voiceBook = book.id;
+        voiceLanguage = book.language;
+        voiceChoice = store.voice(book.id, book.language);
+        catalogAtOpen = PlaybackService.voiceCatalog();
+        displayedCatalog = null;
+        previewRequested = false;
+
+        voiceDialogContent = column();
+        voiceDialogContent.setPadding(dp(24), dp(12), dp(24), dp(12));
+        voiceDialogContent.addView(label("Загружаем голоса Android…", 14, MUTED));
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(voiceDialogContent);
+
+        voiceDialog = new AlertDialog.Builder(this)
+                .setTitle("en".equals(voiceLanguage) ? "Английский голос" : "Русский голос")
+                .setView(scroll)
+                .setNegativeButton("Отмена", null)
+                .setNeutralButton("Прослушать", null)
+                .setPositiveButton("Применить", (dialog, which) ->
+                        startService(voiceIntent(PlaybackService.ACTION_VOICE)))
+                .create();
+        voiceDialog.setOnDismissListener(dialog -> {
+            if (previewRequested) {
+                startService(playbackIntent(PlaybackService.ACTION_CANCEL_PREVIEW));
+            }
+            voiceDialog = null;
+            voiceDialogContent = null;
+        });
+        voiceDialog.show();
+        voiceDialog.getButton(AlertDialog.BUTTON_NEUTRAL).setEnabled(false);
+        voiceDialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+        startService(voiceIntent(PlaybackService.ACTION_LIST_VOICES));
+    }
+
+    private void renderVoices() {
+        if (voiceDialog == null) {
+            return;
+        }
+        PlaybackService.VoiceCatalog catalog = PlaybackService.voiceCatalog();
+        if (catalog == displayedCatalog || catalog == catalogAtOpen || !voiceLanguage.equals(catalog.language)) {
+            return;
+        }
+        displayedCatalog = catalog;
+        Button preview = voiceDialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        Button apply = voiceDialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        voiceDialogContent.removeAllViews();
+        preview.setEnabled(false);
+        apply.setEnabled(false);
+
+        if (catalog.loading) {
+            voiceDialogContent.addView(label("Загружаем голоса Android…", 14, MUTED));
+            return;
+        }
+        if (catalog.options.isEmpty()) {
+            String status = catalog.error == null
+                    ? "Установите офлайн-голос нужного языка в настройках синтеза речи Android." : catalog.error;
+            voiceDialogContent.addView(label(status, 14, INK));
+            Intent settings = new Intent("com.android.settings.TTS_SETTINGS");
+            preview.setText("Настройки");
+            preview.setEnabled(settings.resolveActivity(getPackageManager()) != null);
+            preview.setOnClickListener(view -> {
+                voiceDialog.dismiss();
+                startActivity(settings);
+            });
+            return;
+        }
+
+        if (catalog.error != null) {
+            voiceDialogContent.addView(label(catalog.error, 14, INK));
+        }
+        RadioGroup voices = new RadioGroup(this);
+        voiceDialogContent.addView(voices, fullWidth());
+        boolean knownChoice = false;
+        for (PlaybackService.VoiceOption option : catalog.options) {
+            knownChoice |= option.id.equals(voiceChoice);
+        }
+        if (!knownChoice) {
+            voiceChoice = null;
+        }
+        addVoiceOption(voices, "Автоматически", null);
+        for (PlaybackService.VoiceOption option : catalog.options) {
+            addVoiceOption(voices, option.label, option.id);
+        }
+        preview.setText(catalog.previewing ? "Остановить" : "Прослушать");
+        preview.setEnabled(true);
+        preview.setOnClickListener(view -> {
+            previewRequested = true;
+            startService(voiceIntent(catalog.previewing
+                    ? PlaybackService.ACTION_CANCEL_PREVIEW : PlaybackService.ACTION_PREVIEW));
+        });
+        apply.setEnabled(true);
+    }
+
+    private void addVoiceOption(RadioGroup group, String label, String id) {
+        RadioButton row = new RadioButton(this);
+        row.setId(View.generateViewId());
+        row.setText(label);
+        row.setTextSize(15);
+        row.setMinHeight(dp(48));
+        group.addView(row);
+        if (TextUtils.equals(id, voiceChoice)) {
+            group.check(row.getId());
+        }
+        row.setOnClickListener(view -> voiceChoice = id);
+    }
+
+    private Intent voiceIntent(String action) {
+        return playbackIntent(action).putExtra(PlaybackService.EXTRA_BOOK_ID, voiceBook)
+                .putExtra(PlaybackService.EXTRA_LANGUAGE, voiceLanguage)
+                .putExtra(PlaybackService.EXTRA_VOICE, voiceChoice);
     }
 
     private void chooseLanguage() {
