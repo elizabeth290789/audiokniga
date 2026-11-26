@@ -4,4 +4,5 @@
     <string name="reader_page">Страница %1$d / %2$d</string>
     <string name="reader_page_action">Страница %1$d из %2$d. Перейти к другой странице</string>
     <string name="reader_page_range">Введите номер от 1 до %1$d</string>
+    <string name="supported_book_files">Выберите файл на телефоне. Поддерживаются %1$s.</string>
 </resources>

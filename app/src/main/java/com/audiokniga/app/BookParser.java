@@ -38,6 +38,7 @@ import javax.xml.parsers.SAXParserFactory;
 
 /** Extracts readable text without loading media or resolving external XML resources. */
 public final class BookParser {
+    static final String FORMATS = "EPUB, FB2, TXT, DOC, DOCX, ODT, RTF, PDF и DjVu";
     private static final int TEXT_LIMIT = 16 * 1024 * 1024;
     private static final int EPUB_DOCUMENTS_LIMIT = 24 * 1024 * 1024;
     private static final long EPUB_EXPANDED_LIMIT = 256L * 1024 * 1024;
@@ -92,7 +93,7 @@ public final class BookParser {
         public final String title;
         public final String text;
 
-        private ParsedBook(String title, String text) {
+        ParsedBook(String title, String text) {
             this.title = title;
             this.text = text;
         }
@@ -101,37 +102,56 @@ public final class BookParser {
     /** Consumes the stream, which remains open for the caller to close. */
     public static ParsedBook parse(InputStream input, String filename) throws IOException {
         String extension = extension(filename);
-        String title = "";
-        String text;
+        ParsedBook book;
         switch (extension) {
             case "txt":
-                text = decode(readLimited(input), false).replace("\r\n", "\n").replace('\r', '\n');
+                String text = decode(readLimited(input), false).replace("\r\n", "\n").replace('\r', '\n');
+                book = new ParsedBook("", text);
                 break;
             case "fb2":
                 ContentHandler fb2 = new ContentHandler(true);
                 parseXml(decode(readLimited(input), true), fb2, false);
-                title = fb2.title.toString();
-                text = fb2.text.toString();
+                book = new ParsedBook(fb2.title.toString(), fb2.text.toString());
                 break;
             case "epub":
-                ParsedBook epub = parseEpub(input);
-                title = epub.title;
-                text = epub.text;
+                book = parseEpub(input);
+                break;
+            case "doc":
+                book = LegacyDocParser.parse(input);
+                break;
+            case "docx":
+            case "odt":
+                book = OfficeXmlParser.parse(input, extension);
+                break;
+            case "rtf":
+                book = RtfBookParser.parse(input);
+                break;
+            case "pdf":
+                book = PdfBookParser.parse(input);
+                break;
+            case "djv":
+            case "djvu":
+                book = DjvuBookParser.parse(input);
                 break;
             default:
-                throw new IOException("Поддерживаются файлы EPUB, FB2 и TXT.");
+                throw new IOException("Поддерживаются файлы " + FORMATS + ".");
         }
-        text = text.trim();
+        String text = book.text.trim();
         if (text.isEmpty()) {
             throw new IOException("В файле нет текста для озвучивания.");
         }
+        String title = book.title == null ? "" : book.title.trim();
         if (title.isEmpty()) {
             title = filename.substring(0, filename.lastIndexOf('.')).trim();
             if (title.isEmpty()) {
-                title = filename;
+                title = "Книга";
             }
         }
         return new ParsedBook(title, text);
+    }
+
+    static void parseOfficeXml(byte[] bytes, DefaultHandler handler) throws IOException {
+        parseXml(decode(bytes, true), handler, false);
     }
 
     private static ParsedBook parseEpub(InputStream input) throws IOException {

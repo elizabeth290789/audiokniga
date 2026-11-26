@@ -90,6 +90,7 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         store = new BookStore(this);
+        PdfBookParser.initialize(this);
         PlaybackService.Snapshot playback = PlaybackService.snapshot();
         selectedId = playback.playing ? playback.bookId : store.selected();
         makeScreen();
@@ -387,7 +388,7 @@ public final class MainActivity extends Activity {
         heading.setTypeface(Typeface.create("serif", Typeface.NORMAL));
         heading.setGravity(Gravity.CENTER);
         empty.addView(heading, spaced(15));
-        TextView description = label("Выберите файл EPUB, FB2 или TXT на телефоне.", 14, MUTED);
+        TextView description = label(getString(R.string.supported_book_files, BookParser.FORMATS), 14, MUTED);
         description.setGravity(Gravity.CENTER);
         empty.addView(description, spaced(7));
     }
@@ -495,10 +496,10 @@ public final class MainActivity extends Activity {
             } catch (IOException exception) {
                 error = exception.getMessage();
                 if (error == null || error.trim().isEmpty()) {
-                    error = "Проверьте, что файл доступен и имеет формат EPUB, FB2 или TXT.";
+                    error = "Проверьте формат файла и доступ к нему.";
                 }
             } catch (RuntimeException exception) {
-                error = "Проверьте, что файл доступен и имеет формат EPUB, FB2 или TXT.";
+                error = "Проверьте формат файла и доступ к нему.";
             }
             BookStore.Book imported = book;
             String message = error;
